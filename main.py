@@ -27,6 +27,11 @@ TOP_LINKS = 5  # 요약 뒤에 개별 링크로 보낼 주요 기사 개수
 # 형식: ".../go.html?u="  (뒤에 실제 기사 URL을 인코딩해 붙인다)
 REDIRECT_BASE = "https://lucas-dy.github.io/mobunet-briefing/go.html?u="
 
+# 가족·지인(카톡 친구)에게도 같은 브리핑을 보낼지. 끄려면 SEND_TO_FRIENDS=0.
+# 조건: 받는 사람이 앱 '팀 멤버'로 등록 + 앱에 로그인(친구목록·메시지 동의)해야 하며,
+# 보내는 토큰에 friends 스코프가 있어야 함(get_token.py 재실행). 최대 5명.
+SEND_TO_FRIENDS = os.environ.get("SEND_TO_FRIENDS", "1") != "0"
+
 # 수집할 검색어. 관심사에 맞게 자유롭게 수정하세요.
 QUERIES = [
     "부동산 정책 대출규제",
@@ -237,10 +242,8 @@ def article_link(article: dict) -> str:
     return f"https://news.google.com/search?q={quote(title)}&hl=ko&gl=KR&ceid=KR:ko"
 
 
-def send_message(
-    access_token: str, text: str, link_url: str, button_title: str | None = None
-) -> None:
-    """카카오 '나에게' 텍스트 메시지 1건 발송. 메시지 전체가 link_url로 연결된다."""
+def build_template(text: str, link_url: str, button_title: str | None = None) -> dict:
+    """카카오 텍스트 템플릿 1건 구성. 메시지 전체가 link_url로 연결된다."""
     template = {
         "object_type": "text",
         "text": text[:200],
@@ -248,42 +251,85 @@ def send_message(
     }
     if button_title:
         template["button_title"] = button_title
-
-    resp = requests.post(
-        "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-        headers={"Authorization": f"Bearer {access_token}"},
-        data={"template_object": json.dumps(template, ensure_ascii=False)},
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        print(f"[error] 발송 실패: {resp.text}", file=sys.stderr)
-        resp.raise_for_status()
+    return template
 
 
-def send_to_kakao(text: str, articles: list[dict]) -> None:
-    access_token = get_access_token()
+def build_briefing_templates(text: str, articles: list[dict]) -> list[dict]:
+    """요약 + 주요 기사 메시지들을 템플릿 리스트로 만든다(링크 디코딩은 여기서 1회)."""
+    templates: list[dict] = []
 
-    # 1) 요약 본문 (200자 제한 때문에 여러 건으로 쪼갬)
     parts = chunk(text)
     total = len(parts)
     for i, part in enumerate(parts, start=1):
         suffix = f"\n\n({i}/{total})" if total > 1 else ""
         button = "뉴스 더보기" if i == total else None
-        send_message(access_token, part + suffix, MORE_LINK, button)
-        print(f"[info] 요약 발송 {i}/{total}")
-        time.sleep(1)
+        templates.append(build_template(part + suffix, MORE_LINK, button))
 
-    # 2) 주요 기사: 각 메시지를 누르면 해당 기사로 이동
     linkable = [a for a in articles if a.get("link")][:TOP_LINKS]
     for j, a in enumerate(linkable, start=1):
-        # 제목 끝의 " - 언론사" 꼬리표 제거
-        title = a["title"].rsplit(" - ", 1)[0].strip()
+        title = a["title"].rsplit(" - ", 1)[0].strip()  # 끝의 " - 언론사" 제거
         source = a.get("source", "")
         body = f"[주요 기사 {j}/{len(linkable)}] {title}"
         if source:
             body += f"\n— {source}"
-        send_message(access_token, body, article_link(a), "기사 보기")
-        print(f"[info] 기사 발송 {j}/{len(linkable)}")
+        templates.append(build_template(body, article_link(a), "기사 보기"))
+    return templates
+
+
+def post_message(access_token: str, template: dict, uuids: list[str] | None = None) -> bool:
+    """uuids가 없으면 '나에게', 있으면 '친구에게' 발송. 실패 시 False."""
+    if uuids is None:
+        url = "https://kapi.kakao.com/v2/api/talk/memo/default/send"
+        data = {"template_object": json.dumps(template, ensure_ascii=False)}
+    else:
+        url = "https://kapi.kakao.com/v1/api/talk/friends/message/default/send"
+        data = {
+            "receiver_uuids": json.dumps(uuids),
+            "template_object": json.dumps(template, ensure_ascii=False),
+        }
+    resp = requests.post(
+        url, headers={"Authorization": f"Bearer {access_token}"}, data=data, timeout=15
+    )
+    if resp.status_code != 200:
+        print(f"[error] 발송 실패: {resp.text}", file=sys.stderr)
+        return False
+    return True
+
+
+def get_friend_uuids(access_token: str, limit: int = 5) -> list[str]:
+    """앱과 연결된 친구(가족)의 uuid 목록. friends 권한/연결 친구 없으면 빈 리스트."""
+    resp = requests.get(
+        "https://kapi.kakao.com/v1/api/talk/friends",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"[warn] 친구 목록 조회 실패(친구 발송 건너뜀): {resp.text}", file=sys.stderr)
+        return []
+    return [f["uuid"] for f in resp.json().get("elements", []) if f.get("uuid")][:limit]
+
+
+def send_to_kakao(text: str, articles: list[dict]) -> None:
+    access_token = get_access_token()
+    templates = build_briefing_templates(text, articles)
+
+    # 1) 나에게 보내기 (실패하면 job 실패로 처리)
+    for k, tpl in enumerate(templates, start=1):
+        if not post_message(access_token, tpl):
+            raise RuntimeError(f"나에게 발송 실패 ({k}/{len(templates)})")
+        print(f"[info] 나에게 발송 {k}/{len(templates)}")
+        time.sleep(1)
+
+    # 2) 가족·지인(친구)에게 — 조건 안 맞으면 조용히 건너뜀(나에게 발송은 유지)
+    if not SEND_TO_FRIENDS:
+        return
+    uuids = get_friend_uuids(access_token)
+    if not uuids:
+        print("[info] 앱과 연결된 친구가 없어 친구 발송은 건너뜁니다.")
+        return
+    for k, tpl in enumerate(templates, start=1):
+        ok = post_message(access_token, tpl, uuids)
+        print(f"[info] 친구 발송 {k}/{len(templates)} → {len(uuids)}명 ({'ok' if ok else 'fail'})")
         time.sleep(1)
 
 
