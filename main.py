@@ -9,10 +9,11 @@
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import feedparser
 import requests
@@ -20,6 +21,11 @@ import requests
 KST = timezone(timedelta(hours=9))
 TEXT_LIMIT = 190  # 카카오 텍스트 템플릿 표시 한도 200자 — 여유 두고 190
 TOP_LINKS = 5  # 요약 뒤에 개별 링크로 보낼 주요 기사 개수
+
+# 카카오는 앱에 '등록된 도메인' 링크만 열어준다. 뉴스사 도메인은 수백 개라 다 등록할 수
+# 없으므로, 등록해 둔 GitHub Pages 페이지를 거쳐 실제 기사로 넘긴다.
+# 형식: ".../go.html?u="  (뒤에 실제 기사 URL을 인코딩해 붙인다)
+REDIRECT_BASE = "https://lucas-dy.github.io/mobunet-briefing/go.html?u="
 
 # 수집할 검색어. 관심사에 맞게 자유롭게 수정하세요.
 QUERIES = [
@@ -167,6 +173,70 @@ def chunk(text: str, size: int = TEXT_LIMIT) -> list[str]:
     return chunks
 
 
+def decode_google_news_url(url: str, timeout: int = 20) -> str | None:
+    """구글 뉴스 RSS 중계 링크(.../articles/CBMi…)를 실제 기사 URL로 변환.
+
+    구글이 방식을 바꾸는 등 실패하면 None을 돌려주고, 호출부에서 폴백한다.
+    """
+    try:
+        art_id = urlparse(url).path.split("/")[-1]
+        if "news.google.com" not in url:
+            return url  # 이미 실제 주소면 그대로 사용
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        page = requests.get(
+            f"https://news.google.com/rss/articles/{art_id}",
+            headers=headers,
+            timeout=timeout,
+        )
+        page.raise_for_status()
+        sig = re.search(r'data-n-a-sg="([^"]+)"', page.text)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page.text)
+        if not (sig and ts):
+            return None
+
+        req = json.dumps(
+            [
+                "garturlreq",
+                [
+                    ["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1,
+                     None, None, None, None, None, 0, 1],
+                    "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
+                ],
+                art_id, int(ts.group(1)), sig.group(1),
+            ]
+        )
+        resp = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            data={"f.req": json.dumps([[["Fbv4je", req, None, "generic"]]])},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        for line in resp.text.splitlines():
+            if "garturlres" in line:
+                return json.loads(json.loads(line)[0][2])[1]
+        return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 링크 디코딩 실패: {exc}", file=sys.stderr)
+        return None
+
+
+def article_link(article: dict) -> str:
+    """기사 메시지에 걸 링크. 실제 기사 주소를 등록 도메인(리다이렉트) 뒤에 붙인다.
+
+    디코딩 실패 시엔 등록 도메인인 구글 뉴스 검색으로 폴백(제목으로 검색).
+    """
+    real = decode_google_news_url(article.get("link", ""))
+    if real:
+        return REDIRECT_BASE + quote(real, safe="")
+    title = article["title"].rsplit(" - ", 1)[0].strip()
+    return f"https://news.google.com/search?q={quote(title)}&hl=ko&gl=KR&ceid=KR:ko"
+
+
 def send_message(
     access_token: str, text: str, link_url: str, button_title: str | None = None
 ) -> None:
@@ -212,7 +282,7 @@ def send_to_kakao(text: str, articles: list[dict]) -> None:
         body = f"[주요 기사 {j}/{len(linkable)}] {title}"
         if source:
             body += f"\n— {source}"
-        send_message(access_token, body, a["link"], "기사 보기")
+        send_message(access_token, body, article_link(a), "기사 보기")
         print(f"[info] 기사 발송 {j}/{len(linkable)}")
         time.sleep(1)
 

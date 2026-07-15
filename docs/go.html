@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>기사로 이동 중…</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 15% 8%;
+         text-align: center; color: #333; line-height: 1.6; }
+  a { color: #0b6; word-break: break-all; }
+</style>
+</head>
+<body>
+<p>기사로 이동 중입니다…</p>
+<p>자동으로 넘어가지 않으면 <a id="link">여기</a>를 누르세요.</p>
+<script>
+  // 카카오는 등록된 도메인(이 페이지) 링크만 열어주므로,
+  // 여기서 실제 기사 주소(?u=)로 한 번 더 넘겨준다.
+  var u = new URLSearchParams(location.search).get("u");
+  if (u && /^https?:\/\//i.test(u)) {
+    document.getElementById("link").href = u;
+    location.replace(u);
+  } else {
+    document.body.innerHTML = "<p>잘못된 링크입니다.</p>";
+  }
+</script>
+</body>
+</html>
