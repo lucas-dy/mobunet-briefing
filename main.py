@@ -19,6 +19,7 @@ import requests
 
 KST = timezone(timedelta(hours=9))
 TEXT_LIMIT = 190  # 카카오 텍스트 템플릿 표시 한도 200자 — 여유 두고 190
+TOP_LINKS = 5  # 요약 뒤에 개별 링크로 보낼 주요 기사 개수
 
 # 수집할 검색어. 관심사에 맞게 자유롭게 수정하세요.
 QUERIES = [
@@ -166,34 +167,53 @@ def chunk(text: str, size: int = TEXT_LIMIT) -> list[str]:
     return chunks
 
 
-def send_to_kakao(text: str) -> None:
+def send_message(
+    access_token: str, text: str, link_url: str, button_title: str | None = None
+) -> None:
+    """카카오 '나에게' 텍스트 메시지 1건 발송. 메시지 전체가 link_url로 연결된다."""
+    template = {
+        "object_type": "text",
+        "text": text[:200],
+        "link": {"web_url": link_url, "mobile_web_url": link_url},
+    }
+    if button_title:
+        template["button_title"] = button_title
+
+    resp = requests.post(
+        "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+        headers={"Authorization": f"Bearer {access_token}"},
+        data={"template_object": json.dumps(template, ensure_ascii=False)},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"[error] 발송 실패: {resp.text}", file=sys.stderr)
+        resp.raise_for_status()
+
+
+def send_to_kakao(text: str, articles: list[dict]) -> None:
     access_token = get_access_token()
+
+    # 1) 요약 본문 (200자 제한 때문에 여러 건으로 쪼갬)
     parts = chunk(text)
     total = len(parts)
-
     for i, part in enumerate(parts, start=1):
         suffix = f"\n\n({i}/{total})" if total > 1 else ""
-        is_last = i == total
+        button = "뉴스 더보기" if i == total else None
+        send_message(access_token, part + suffix, MORE_LINK, button)
+        print(f"[info] 요약 발송 {i}/{total}")
+        time.sleep(1)
 
-        template = {
-            "object_type": "text",
-            "text": (part + suffix)[:200],
-            "link": {"web_url": MORE_LINK, "mobile_web_url": MORE_LINK},
-        }
-        if is_last:
-            template["button_title"] = "뉴스 더보기"
-
-        resp = requests.post(
-            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-            headers={"Authorization": f"Bearer {access_token}"},
-            data={"template_object": json.dumps(template, ensure_ascii=False)},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            print(f"[error] 발송 실패 ({i}/{total}): {resp.text}", file=sys.stderr)
-            resp.raise_for_status()
-
-        print(f"[info] 발송 완료 {i}/{total}")
+    # 2) 주요 기사: 각 메시지를 누르면 해당 기사로 이동
+    linkable = [a for a in articles if a.get("link")][:TOP_LINKS]
+    for j, a in enumerate(linkable, start=1):
+        # 제목 끝의 " - 언론사" 꼬리표 제거
+        title = a["title"].rsplit(" - ", 1)[0].strip()
+        source = a.get("source", "")
+        body = f"[주요 기사 {j}/{len(linkable)}] {title}"
+        if source:
+            body += f"\n— {source}"
+        send_message(access_token, body, a["link"], "기사 보기")
+        print(f"[info] 기사 발송 {j}/{len(linkable)}")
         time.sleep(1)
 
 
@@ -208,7 +228,7 @@ def main() -> None:
     print(text)
     print("--------------------")
 
-    send_to_kakao(text)
+    send_to_kakao(text, articles)
 
 
 if __name__ == "__main__":
