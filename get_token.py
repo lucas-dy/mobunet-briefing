@@ -32,7 +32,7 @@ def main() -> None:
             "client_id": rest_api_key,
             "redirect_uri": REDIRECT_URI,
             "response_type": "code",
-            "scope": "talk_message,friends",
+            "scope": "talk_message",
         }
     )
 
